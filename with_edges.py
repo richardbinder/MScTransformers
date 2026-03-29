@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import util
 
 from torch_geometric.datasets import ZINC
 from torch_geometric.loader import DataLoader
@@ -213,6 +214,18 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+
+    k = 8
+
+    enc = E_train[0:train_base.get(0).num_nodes]
+
+    with torch.no_grad():
+        enc_norm = util.normalize_enc_torch(enc)
+
+    # Reconstruct adjacency from normalized encodings
+    L_n = enc_norm[:, :k]
+    R_n = enc_norm[:, k:]
+    A_reconstructed = (L_n @ R_n.T > 0).float()
 
     # Model
     in_dim = int(E_train.size(1))
