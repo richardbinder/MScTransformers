@@ -1,0 +1,4 @@
+encodings
+.idea
+.venv
+data/*
