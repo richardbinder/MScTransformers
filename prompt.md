@@ -1,0 +1,1 @@
+Add an additional option to predict the diameter of a graph (farthest distance between any two of its vertices). You may need to adapt the feature vector now, since (I believe?) the top affinity values are probably not enough now to figure out where the edges of the graph lie.

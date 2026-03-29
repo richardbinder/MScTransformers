@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import math
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -32,6 +33,7 @@ class ZINCEncodingOnlyDataset(torch.utils.data.Dataset):
         factor_dim: Optional[int] = None,
         edge_threshold: float = 0.0,
         topk_neighbors: int = 0,
+        target_name: str = "max_degree",
     ):
         super().__init__()
         self.ds = base_dataset
@@ -39,6 +41,7 @@ class ZINCEncodingOnlyDataset(torch.utils.data.Dataset):
         self.factor_dim = factor_dim
         self.edge_threshold = edge_threshold
         self.topk_neighbors = topk_neighbors
+        self.target_name = target_name
 
         assert hasattr(self.ds, "slices") and "x" in self.ds.slices, (
             "Expected an InMemoryDataset with slices['x']."
@@ -73,7 +76,24 @@ class ZINCEncodingOnlyDataset(torch.utils.data.Dataset):
         end = int(self.ds.slices["x"][idx + 1])
         return self.encodings[start:end]
 
-    def _build_graph_from_encoding(self, enc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _topk_affinity_features(self, affinity: torch.Tensor) -> torch.Tensor:
+        n = affinity.size(0)
+        k = self.factor_dim
+        if n <= 1:
+            return affinity.new_zeros((n, k))
+
+        finite_affinity = torch.where(torch.isfinite(affinity), affinity, torch.full_like(affinity, float("-inf")))
+        row_k = min(k, n - 1)
+        top_values, _ = torch.topk(finite_affinity, k=row_k, dim=1)
+        top_values = torch.where(torch.isfinite(top_values), top_values, torch.zeros_like(top_values))
+
+        if row_k == k:
+            return top_values
+
+        padding = affinity.new_zeros((n, k - row_k))
+        return torch.cat([top_values, padding], dim=1)
+
+    def _build_graph_from_encoding(self, enc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         enc_norm = util.normalize_enc_torch(enc)
         left = enc_norm[:, : self.factor_dim]
         right = enc_norm[:, self.factor_dim :]
@@ -107,6 +127,10 @@ class ZINCEncodingOnlyDataset(torch.utils.data.Dataset):
         pos_strength = affinity.clamp_min(0.0)
         pos_strength = torch.where(torch.isfinite(pos_strength), pos_strength, torch.zeros_like(pos_strength))
         proxy_strength = pos_strength.sum(dim=1, keepdim=True)
+        finite_affinity = torch.where(torch.isfinite(affinity), affinity, torch.zeros_like(affinity))
+        row_mean = finite_affinity.mean(dim=1, keepdim=True)
+        row_std = finite_affinity.std(dim=1, keepdim=True, unbiased=False)
+        top_affinity = self._topk_affinity_features(affinity)
 
         denom = max(n - 1, 1)
         node_features = torch.cat(
@@ -114,22 +138,69 @@ class ZINCEncodingOnlyDataset(torch.utils.data.Dataset):
                 enc_norm,
                 proxy_degree / denom,
                 proxy_strength / max(n, 1),
+                row_mean,
+                row_std,
+                top_affinity,
             ],
             dim=1,
         )
 
         return node_features, edge_index, edge_attr
 
+    def _graph_target(self, base_graph: Data) -> torch.Tensor:
+        if self.target_name == "max_degree":
+            return degree(
+                base_graph.edge_index[0],
+                num_nodes=base_graph.num_nodes,
+                dtype=torch.float,
+            ).max()
+
+        if self.target_name == "diameter":
+            return torch.tensor(
+                self._graph_diameter(base_graph.edge_index, base_graph.num_nodes),
+                dtype=torch.float,
+            )
+
+        raise ValueError(f"Unsupported target_name={self.target_name!r}.")
+
+    @staticmethod
+    def _graph_diameter(edge_index: torch.Tensor, num_nodes: int) -> int:
+        if num_nodes <= 1:
+            return 0
+
+        adjacency = [[] for _ in range(num_nodes)]
+        src_nodes = edge_index[0].tolist()
+        dst_nodes = edge_index[1].tolist()
+        for src, dst in zip(src_nodes, dst_nodes):
+            adjacency[src].append(dst)
+
+        diameter = 0
+        for start in range(num_nodes):
+            distances = [-1] * num_nodes
+            distances[start] = 0
+            queue = deque([start])
+
+            while queue:
+                node = queue.popleft()
+                base_distance = distances[node] + 1
+                for neighbor in adjacency[node]:
+                    if distances[neighbor] != -1:
+                        continue
+                    distances[neighbor] = base_distance
+                    queue.append(neighbor)
+
+            farthest = max(distances)
+            if farthest == -1:
+                continue
+            diameter = max(diameter, farthest)
+
+        return diameter
+
     def __getitem__(self, idx: int) -> Data:
         base_graph = self.ds.get(idx)
         enc = self._encoding_slice(idx)
         x, edge_index, edge_attr = self._build_graph_from_encoding(enc)
-
-        target = degree(
-            base_graph.edge_index[0],
-            num_nodes=base_graph.num_nodes,
-            dtype=torch.float,
-        ).max()
+        target = self._graph_target(base_graph)
 
         return Data(
             x=x,
@@ -283,6 +354,13 @@ def main():
     parser.add_argument("--factor_dim", type=int, default=None, help="Width of the left matrix factor.")
     parser.add_argument("--edge_threshold", type=float, default=0.0, help="Affinity threshold for reconstructed edges.")
     parser.add_argument("--topk_neighbors", type=int, default=4, help="Extra high-affinity neighbors kept per node.")
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="max_degree",
+        choices=("max_degree", "diameter"),
+        help="Graph-level regression target to predict from the reconstructed graph.",
+    )
     parser.add_argument("--patience", type=int, default=20, help="Early-stopping patience on validation RMSE.")
     args = parser.parse_args()
 
@@ -302,6 +380,7 @@ def main():
         factor_dim=args.factor_dim,
         edge_threshold=args.edge_threshold,
         topk_neighbors=args.topk_neighbors,
+        target_name=args.target,
     )
     val_ds = ZINCEncodingOnlyDataset(
         val_base,
@@ -309,6 +388,7 @@ def main():
         factor_dim=args.factor_dim,
         edge_threshold=args.edge_threshold,
         topk_neighbors=args.topk_neighbors,
+        target_name=args.target,
     )
     test_ds = ZINCEncodingOnlyDataset(
         test_base,
@@ -316,6 +396,7 @@ def main():
         factor_dim=args.factor_dim,
         edge_threshold=args.edge_threshold,
         topk_neighbors=args.topk_neighbors,
+        target_name=args.target,
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
@@ -358,7 +439,8 @@ def main():
         if epoch == 1 or epoch % 5 == 0:
             print(
                 f"Epoch {epoch:03d} | train loss {train_loss:.4f} | "
-                f"val MAE {val_mae:.4f} | val RMSE {val_rmse:.4f} | best RMSE {best_val_rmse:.4f}"
+                f"val {args.target} MAE {val_mae:.4f} | "
+                f"val {args.target} RMSE {val_rmse:.4f} | best RMSE {best_val_rmse:.4f}"
             )
 
         if epochs_without_improvement >= args.patience:
@@ -369,8 +451,8 @@ def main():
         model.load_state_dict(best_state)
 
     test_mae, test_rmse = evaluate(model, test_loader, device)
-    print(f"Test MAE: {test_mae:.4f}")
-    print(f"Test RMSE: {test_rmse:.4f}")
+    print(f"Test {args.target} MAE: {test_mae:.4f}")
+    print(f"Test {args.target} RMSE: {test_rmse:.4f}")
 
 
 if __name__ == "__main__":
